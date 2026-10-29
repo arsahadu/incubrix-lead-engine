@@ -1,8 +1,6 @@
-
-# app/discover.py
-
 import csv
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,23 +14,36 @@ API_URL = "https://www.googleapis.com/youtube/v3/search"
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_FILE = ROOT / "data" / "discovered_creators.csv"
+CHECKPOINT_FILE = ROOT / "data" / "discovery_checkpoint.txt"
+MAX_SEARCHES_PER_RUN = 10
 
-# Markets allowed by the assessment.
-MARKETS = {
-    "US": ["United States", "American"],
-    "CA": ["Canada", "Canadian"],
-    "GB": ["United Kingdom", "British"],
-    "IE": ["Ireland", "Irish"],
-    "AU": ["Australia", "Australian"],
-    "NZ": ["New Zealand"],
-    "SG": ["Singapore"],
-}
+MARKETS = ["US", "CA", "GB", "IE", "AU", "NZ", "SG"]
 
-# Focus on creators, not agencies or generic brands.
+# Target individual creators, not generic companies or news brands.
 NICHES = [
-    "educational creator online course",
-    "business coach consultant creator",
-    "expert video podcast",
+    # Educators
+    "independent online educator tutorial",
+    "English teacher teaching lessons",
+    "programming educator coding tutorials",
+    "science educator explaining concepts",
+    "online course instructor teaching",
+    "language teacher lesson walkthrough",
+    "career skills educator tutorials",
+
+    # Coaches and expert-led creators
+    "career coach advice",
+    "business coach teaching entrepreneurs",
+    "personal finance educator explaining",
+    "leadership coach teaching skills",
+    "fitness coach educational videos",
+    "consultant explaining professional skills",
+
+    # Podcasts and video-first creators
+    "independent podcast host interview",
+    "expert interview video podcast",
+    "educational podcast host",
+    "solo creator educational video essay",
+    "creator explaining how they make videos",
 ]
 
 FIELDS = [
@@ -49,8 +60,7 @@ FIELDS = [
 
 
 def search_videos(query, country):
-    """Search recent public videos using the official YouTube API."""
-
+    """Search recent videos through the official YouTube API."""
     if not API_KEY:
         raise RuntimeError("YOUTUBE_API_KEY is missing from .env")
 
@@ -70,66 +80,142 @@ def search_videos(query, country):
         "relevanceLanguage": "en",
     }
 
-    response = requests.get(API_URL, params=params, timeout=30)
-    response.raise_for_status()
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                API_URL, params=params, timeout=25
+            )
 
-    return response.json().get("items", [])
+            if response.status_code == 429:
+                print("  Rate limited; skipping this query for now.")
+                return []
+
+            if response.status_code >= 500:
+                if attempt < 2:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+
+            response.raise_for_status()
+            return response.json().get("items", [])
+
+        except requests.HTTPError as error:
+            # Never print the request URL: it contains the API key.
+            status = (
+                error.response.status_code
+                if error.response is not None
+                else "unknown"
+            )
+            try:
+                reason = error.response.json()["error"]["errors"][0]["reason"]
+            except (AttributeError, KeyError, IndexError, ValueError):
+                reason = "unknown"
+
+            print(f"  YouTube API error: HTTP {status}; reason={reason}")
+
+            # Quota/authentication errors won't be fixed by retrying.
+            if status in (400, 401, 403):
+                break
+
+            if attempt < 2:
+                time.sleep(2 ** (attempt + 1))
+
+        except requests.RequestException as error:
+            # Print only the exception type to avoid exposing URL details.
+            print(f"  Network error: {type(error).__name__}")
+            if attempt < 2:
+                time.sleep(2 ** (attempt + 1))
+
+    raise RuntimeError("Search failed; checkpoint must not advance")
+
 
 
 def discover_creators():
-    """Discover unique channels across niches and target markets."""
-
+    """Discover unique channels and resume from the last completed query."""
     creators = {}
     today = datetime.now(timezone.utc).date().isoformat()
 
-    for country, terms in MARKETS.items():
-        for niche in NICHES:
-            for term in terms:
-                query = f"{niche} {term}"
-                print(f"Searching {country}: {query}")
+    # Load existing channels so checkpoint saves don't lose local state.
+    if OUTPUT_FILE.exists():
+        with OUTPUT_FILE.open("r", newline="", encoding="utf-8") as file:
+            for row in csv.DictReader(file):
+                creators[row["channel_id"]] = row
 
-                try:
-                    videos = search_videos(query, country)
+    # Resume from the next query after the last completed search.
+    queries = [
+        (country, niche)
+        for country in MARKETS
+        for niche in NICHES
+    ]
 
-                    for video in videos:
-                        snippet = video.get("snippet", {})
-                        video_id = video.get("id", {}).get("videoId")
-                        channel_id = snippet.get("channelId")
+    start_index = 0
+    if CHECKPOINT_FILE.exists():
+        try:
+            start_index = int(
+                CHECKPOINT_FILE.read_text(encoding="utf-8").strip()
+            )
+        except ValueError:
+            start_index = 0
 
-                        if not video_id or not channel_id:
-                            continue
+    end_index = min(start_index + MAX_SEARCHES_PER_RUN, len(queries))
+    print(f"Starting at query {start_index + 1} of {len(queries)}")
+    print(f"This run will attempt up to {end_index - start_index} searches")
 
-                        if channel_id not in creators:
-                            creators[channel_id] = {
-                                "channel_id": channel_id,
-                                "creator_name": snippet.get(
-                                    "channelTitle", ""
-                                ),
-                                "profile_url": (
-                                    "https://www.youtube.com/channel/"
-                                    f"{channel_id}"
-                                ),
-                                "video_url": (
-                                    f"https://www.youtube.com/watch?v={video_id}"
-                                ),
-                                "video_title": snippet.get("title", ""),
-                                "video_published_at": snippet.get(
-                                    "publishedAt", ""
-                                ),
-                                "search_query": query,
-                                "discovery_region": country,
-                                "discovered_at": today,
-                            }
+    for index in range(start_index, end_index):
+        country, niche = queries[index]
+        print(f"Searching {country}: {niche}")
 
-                except requests.RequestException as error:
-                    print(f"  Search failed: {error}")
+        try:
+            videos = search_videos(niche, country)
+        except RuntimeError as error:
+            print(f"Stopping discovery: {error}")
+            break   
 
+        for video in videos:
+            snippet = video.get("snippet", {})
+            video_id = video.get("id", {}).get("videoId")
+            channel_id = snippet.get("channelId")
+
+            if not video_id or not channel_id:
+                continue
+
+            if channel_id not in creators:
+                creators[channel_id] = {
+                    "channel_id": channel_id,
+                    "creator_name": snippet.get("channelTitle", ""),
+                    "profile_url": (
+                        "https://www.youtube.com/channel/" f"{channel_id}"
+                    ),
+                    "video_url": f"https://www.youtube.com/watch?v={video_id}",
+                    "video_title": snippet.get("title", ""),
+                    "video_published_at": snippet.get("publishedAt", ""),
+                    "search_query": niche,
+                    "discovery_region": country,
+                    "discovered_at": today,
+                }
+            else:
+                old = creators[channel_id]
+                regions = set(
+                    filter(None, old.get("discovery_region", "").split(";"))
+                )
+                regions.add(country)
+                old["discovery_region"] = ";".join(sorted(regions))
+
+        # Save accumulated results after every query.
+        save_candidates(list(creators.values()))
+
+        # Advance checkpoint only after this query has finished.
+        CHECKPOINT_FILE.write_text(
+            str(index + 1), encoding="utf-8"
+        )
+
+        time.sleep(1)
+
+    print(f"Completed queries {start_index + 1} to {end_index}")
+    print(f"Next checkpoint: {end_index}")
     return list(creators.values())
-
 
 def save_candidates(candidates):
     """Merge new discoveries with existing records by channel ID."""
-
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     existing = {}
 
@@ -149,12 +235,13 @@ def save_candidates(candidates):
             existing[channel_id] = candidate
             new_count += 1
         else:
-            # Preserve the original record and add new discovery evidence.
             old = existing[channel_id]
             old_regions = set(
                 filter(None, old.get("discovery_region", "").split(";"))
             )
-            old_regions.add(candidate["discovery_region"])
+            old_regions.update(
+                filter(None, candidate["discovery_region"].split(";"))
+            )
             old["discovery_region"] = ";".join(sorted(old_regions))
 
     with OUTPUT_FILE.open(

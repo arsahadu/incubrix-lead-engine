@@ -1,7 +1,5 @@
-
 import csv
 import os
-import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,17 +15,17 @@ ROOT = Path(__file__).resolve().parent.parent
 INPUT_FILE = ROOT / "data" / "discovered_creators.csv"
 OUTPUT_FILE = ROOT / "data" / "enriched_creators.csv"
 
+CACHE_DAYS = 7
+
 
 def api_get(endpoint, params):
     """Call the YouTube Data API."""
     if not API_KEY:
         raise RuntimeError("YOUTUBE_API_KEY is missing from .env")
 
-    params["key"] = API_KEY
-
     response = requests.get(
         f"{BASE_URL}/{endpoint}",
-        params=params,
+        params={**params, "key": API_KEY},
         timeout=30,
     )
     response.raise_for_status()
@@ -35,7 +33,7 @@ def api_get(endpoint, params):
 
 
 def get_channel_details(channel_ids):
-    """Retrieve metadata for channels in batches of 50."""
+    """Retrieve channel metadata in batches of 50."""
     channels = {}
 
     for start in range(0, len(channel_ids), 50):
@@ -65,7 +63,7 @@ def get_channel_details(channel_ids):
 
 
 def get_recent_videos(playlist_id, cutoff):
-    """Fetch recent uploads and stop when they are older than 60 days."""
+    """Retrieve uploads published within the last 60 days."""
     videos = []
     page_token = None
 
@@ -80,7 +78,7 @@ def get_recent_videos(playlist_id, cutoff):
             params["pageToken"] = page_token
 
         result = api_get("playlistItems", params)
-        stop = False
+        reached_cutoff = False
 
         for item in result.get("items", []):
             snippet = item.get("snippet", {})
@@ -94,7 +92,7 @@ def get_recent_videos(playlist_id, cutoff):
             )
 
             if published_at < cutoff:
-                stop = True
+                reached_cutoff = True
                 break
 
             video_id = (
@@ -105,12 +103,11 @@ def get_recent_videos(playlist_id, cutoff):
             if video_id:
                 videos.append({
                     "video_id": video_id,
-                    "title": snippet.get("title", ""),
                     "published_at": published,
                     "url": f"https://www.youtube.com/watch?v={video_id}",
                 })
 
-        if stop:
+        if reached_cutoff:
             break
 
         page_token = result.get("nextPageToken")
@@ -135,6 +132,11 @@ def get_video_durations(video_ids):
 
         for video in result.get("items", []):
             duration = video.get("contentDetails", {}).get("duration", "")
+            total_seconds = 0
+
+            # Parse ISO 8601 durations such as PT12M30S.
+            import re
+
             match = re.fullmatch(
                 r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?",
                 duration,
@@ -144,38 +146,91 @@ def get_video_durations(video_ids):
                 hours, minutes, seconds = (
                     int(value or 0) for value in match.groups()
                 )
-                durations[video["id"]] = (
-                    hours * 3600 + minutes * 60 + seconds
-                )
+                total_seconds = hours * 3600 + minutes * 60 + seconds
+
+            durations[video["id"]] = total_seconds
 
     return durations
 
 
+def load_existing():
+    """Load previous results for cache reuse."""
+    if not OUTPUT_FILE.exists():
+        return {}
+
+    with OUTPUT_FILE.open("r", newline="", encoding="utf-8") as file:
+        return {
+            row["channel_id"]: row
+            for row in csv.DictReader(file)
+            if row.get("channel_id")
+        }
+
+
+def is_cache_fresh(row, now):
+    """Reuse only successful records enriched within seven days."""
+    if row.get("enrichment_status") != "success":
+        return False
+
+    timestamp = row.get("enriched_at", "")
+
+    if not timestamp:
+        return False
+
+    try:
+        enriched_at = datetime.fromisoformat(timestamp)
+        if enriched_at.tzinfo is None:
+            enriched_at = enriched_at.replace(tzinfo=timezone.utc)
+
+        return now - enriched_at < timedelta(days=CACHE_DAYS)
+
+    except ValueError:
+        return False
+
+
 def enrich_creators():
-    """Enrich discoveries and save activity evidence."""
+    """Enrich new/stale channels and reuse fresh cached records."""
     with INPUT_FILE.open("r", newline="", encoding="utf-8") as file:
         candidates = list(csv.DictReader(file))
 
-    channel_ids = list(dict.fromkeys(
-        row["channel_id"] for row in candidates if row.get("channel_id")
-    ))
-
-    channel_details = get_channel_details(channel_ids)
+    # Keep one record per stable channel ID.
+    unique_candidates = {
+        row["channel_id"]: row
+        for row in candidates
+        if row.get("channel_id")
+    }
 
     now = datetime.now(timezone.utc)
+    existing = load_existing()
+
+    fresh = {}
+    stale = {}
+
+    for channel_id, candidate in unique_candidates.items():
+        cached = existing.get(channel_id)
+
+        if cached and is_cache_fresh(cached, now):
+            fresh[channel_id] = cached
+        else:
+            stale[channel_id] = candidate
+
+    print(f"Total unique channels: {len(unique_candidates)}")
+    print(f"Using fresh cache: {len(fresh)}")
+    print(f"Need enrichment: {len(stale)}")
+
+    # Fetch metadata only for channels needing enrichment.
+    details_by_id = get_channel_details(list(stale))
+
     cutoff_30 = now - timedelta(days=30)
     cutoff_60 = now - timedelta(days=60)
+    output = dict(fresh)
 
-    enriched = []
+    for index, (channel_id, candidate) in enumerate(stale.items(), start=1):
+        print(f"[{index}/{len(stale)}] {candidate.get('creator_name', '')}")
 
-    for index, row in enumerate(candidates, start=1):
-        channel_id = row["channel_id"]
-        details = channel_details.get(channel_id, {})
-
-        print(f"[{index}/{len(candidates)}] {row['creator_name']}")
+        details = details_by_id.get(channel_id, {})
 
         record = {
-            **row,
+            **candidate,
             "subscribers": details.get("subscribers", ""),
             "country_iso2": details.get("country_iso2", ""),
             "channel_description": details.get("description", ""),
@@ -185,17 +240,18 @@ def enrich_creators():
             "longform_count_60d": 0,
             "enrichment_status": "pending",
             "enrichment_error": "",
+            "enriched_at": now.isoformat(),
         }
 
         try:
-            uploads_playlist = details.get("uploads_playlist", "")
+            playlist_id = details.get("uploads_playlist")
 
-            if not uploads_playlist:
+            if not playlist_id:
                 record["enrichment_status"] = "no_uploads_playlist"
-                enriched.append(record)
+                output[channel_id] = record
                 continue
 
-            videos = get_recent_videos(uploads_playlist, cutoff_60)
+            videos = get_recent_videos(playlist_id, cutoff_60)
 
             if videos:
                 record["last_content_date"] = videos[0]["published_at"]
@@ -212,6 +268,8 @@ def enrich_creators():
                 video["video_id"] for video in videos
             ])
 
+            # Provisional metric only; the assessment does not
+            # specify a precise long-form duration threshold.
             record["longform_count_60d"] = sum(
                 durations.get(video["video_id"], 0) > 60
                 for video in videos
@@ -224,21 +282,19 @@ def enrich_creators():
             record["enrichment_error"] = str(error)
             print(f"  Error: {error}")
 
-        enriched.append(record)
+        output[channel_id] = record
 
-    if enriched:
-        OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-
+    if output:
         fields = list(dict.fromkeys(
-            key for record in enriched for key in record
+            key for row in output.values() for key in row
         ))
 
         with OUTPUT_FILE.open("w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fields)
             writer.writeheader()
-            writer.writerows(enriched)
+            writer.writerows(output.values())
 
-    print(f"\nChannels processed: {len(enriched)}")
+    print(f"\nChannels saved: {len(output)}")
     print(f"Output: {OUTPUT_FILE}")
 
 

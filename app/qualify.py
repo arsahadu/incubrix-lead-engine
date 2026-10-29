@@ -6,23 +6,18 @@ from app.config import DATA_DIR
 INPUT_FILE = DATA_DIR / "enriched_creators.csv"
 OUTPUT_FILE = DATA_DIR / "qualification_review.csv"
 
-# Countries explicitly allowed by the assessment.
-APPROVED_COUNTRIES = {
-    "US", "CA", "GB", "IE", "AU", "NZ", "SG"
-}
+APPROVED_COUNTRIES = {"US", "CA", "GB", "IE", "AU", "NZ", "SG"}
 
 
 def check_activity(row):
-    """Check the assessment's activity requirement."""
+    """Check activity; long-form counts still need verification."""
 
-    recent = row.get("content_count_30d", 0)
-    longform = row.get("longform_count_60d", 0)
+    recent = pd.to_numeric(row.get("content_count_30d"), errors="coerce")
+    longform = pd.to_numeric(row.get("longform_count_60d"), errors="coerce")
 
     if pd.notna(recent) and recent >= 8:
         return "pass"
 
-    # Duration threshold has not been specified by the assessment.
-    # Do not treat the current duration-based count as final evidence.
     if pd.notna(longform) and longform >= 2:
         return "manual_review"
 
@@ -30,50 +25,55 @@ def check_activity(row):
 
 
 def check_country(value):
-    """Check whether the reported country is an approved market."""
+    """Classify reported country; verify it using public evidence later."""
 
     if pd.isna(value) or not str(value).strip():
-        return "manual_review"
+        return "unknown"
 
-    if str(value).strip().upper() in APPROVED_COUNTRIES:
-        return "pass"
+    country = str(value).strip().upper()
 
-    return "fail"
+    if country in APPROVED_COUNTRIES:
+        return "target_market"
+
+    # The assessment allows up to 20% of leads from other markets.
+    return "other_market"
 
 
 def qualify_candidates():
     df = pd.read_csv(INPUT_FILE)
-
     results = []
 
     for _, row in df.iterrows():
         country_status = check_country(row.get("country_iso2"))
         activity_status = check_activity(row)
-
         reasons = []
 
-        if country_status == "fail":
-            reasons.append("Country outside approved markets")
+        if country_status == "unknown":
+            reasons.append("Country needs public verification")
 
-        elif country_status == "manual_review":
-            reasons.append("Country missing or unverified")
+        elif country_status == "other_market":
+            reasons.append("Outside primary target markets; check market mix")
 
         if activity_status == "fail":
             reasons.append("Activity requirement not met")
 
         elif activity_status == "manual_review":
-            reasons.append("Long-form activity requires review")
+            reasons.append("Verify two qualifying long-form items")
 
         if row.get("enrichment_status") != "success":
             reasons.append("Enrichment unsuccessful")
 
-        if reasons:
-            status = "rejected" if (
-                country_status == "fail"
-                or activity_status == "fail"
-            ) else "needs_manual_review"
+        # Reject only when the activity check clearly fails.
+        if activity_status == "fail":
+            status = "rejected"
+        elif (
+            country_status == "unknown"
+            or activity_status == "manual_review"
+            or row.get("enrichment_status") != "success"
+        ):
+            status = "needs_manual_review"
         else:
-            status = "activity_country_passed"
+            status = "initial_screen_passed"
 
         results.append({
             "channel_id": row["channel_id"],
@@ -91,7 +91,7 @@ def qualify_candidates():
     output = pd.DataFrame(results)
     output.to_csv(OUTPUT_FILE, index=False)
 
-    print("\nCandidate screening summary:")
+    print("\nInitial screening summary:")
     print(output["candidate_status"].value_counts().to_string())
     print(f"\nSaved review file: {OUTPUT_FILE}")
 
