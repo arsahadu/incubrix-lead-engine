@@ -77,22 +77,11 @@ Requires Python 3 and a YouTube Data API key.
 
 ## Running the Pipeline
 
-Run commands from the project root with the virtual environment activated.
+Run command from the project root with the virtual environment activated.
 
 ```bash
-python -m app.discover
-python -m app.enrich
-python -m app.verify
-python -m app.prioritize
-python -m app.extract_contacts
-python -m app.qualify
-python -m app.export_leads
-python -m app.generate_outreach
+python -m app.run_pipeline
 ```
-
-Each stage performs a different part of the workflow. Run stages in the appropriate order because later stages depend on earlier outputs.
-
-Discovery uses the YouTube Data API quota. Avoid rerunning discovery unnecessarily.
 
 ## Outputs
 
